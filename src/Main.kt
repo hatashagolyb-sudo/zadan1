@@ -1,115 +1,77 @@
-import java.util.Locale
-import kotlin.properties.Delegates
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.flow.*
 
-class InsufficientFundsException(message: String) : Exception(message)
+// ============================================================
+// Модель данных
+// ============================================================
+data class SensorReading(
+    val sensorId: String,
+    val value: Double,
+    val timestamp: Long
+)
 
-infix fun Double.formattedAs(currency: String): String {
-    val number = String.format(Locale.US, "%,.2f", this).replace(',', ' ')
-    return "$number $currency"
-}
-
-fun Double.formatAsCurrency(): String = this formattedAs "NC"
-
-interface PaymentMethod
-
-class CardPayment(val last4Digits: String) : PaymentMethod
-
-class CryptoPayment(val walletAddress: String) : PaymentMethod
-
-class SmartWallet(val owner: String?, initialBalance: Double) {
-
-    var balance: Double by Delegates.observable(initialBalance) { _, oldValue, newValue ->
-        println("Лог ЛЯЛЯЛЯ: $oldValue -> $newValue")
-    }
-
-    val auditInfo: String by lazy {
-        println("Формирование финансового отчета...")
-        "Финансовый отчет: владелец - ${owner ?: "Анонимный пользователь"}, " +
-                "баланс - ${balance.formatAsCurrency()}"
-    }
-
-    fun printOwnerInfo() {
-        println("Владелец: ${owner?.uppercase() ?: "Анонимный пользователь"}")
-    }
-
-    operator fun plus(amount: Double): SmartWallet {
-        balance += amount
-        return this
-    }
-
-    operator fun minus(amount: Double): SmartWallet {
-        if (amount < 0) {
-            throw InsufficientFundsException("Нельзя снять отрицательную сумму: $amount")
-        }
-        if (amount > balance) {
-            throw InsufficientFundsException(
-                "Недостаточно средств: запрошено $amount, на счете $balance"
-            )
-        }
-        balance -= amount
-        return this
-    }
-
-    fun processPayment(method: PaymentMethod) {
-        if (method is CardPayment) {
-            val card = method as? CardPayment
-            println("Оплата картой, последние 4 цифры: ${card?.last4Digits}")
-        } else if (method is CryptoPayment) {
-            val crypto = method as? CryptoPayment
-            println("Оплата криптовалютой, адрес: ${crypto?.walletAddress}")
-        } else {
-            println("Неизвестное платежное средство")
+// ============================================================
+// Корутины: параллельная генерация событий
+// ============================================================
+suspend fun emitSensorData(channel: SendChannel<SensorReading>) {
+    val sensors = listOf("TEMP", "HUM", "CO2")
+    coroutineScope {
+        for (sensorId in sensors) {
+            launch {
+                for (i in 0..9) {
+                    delay(500L)
+                    val reading = SensorReading(sensorId, 15.0 + i * 2.0, System.currentTimeMillis())
+                    channel.send(reading)
+                }
+            }
         }
     }
+    channel.close()
 }
 
-class WalletBuilder {
-    var owner: String? = null
-    var initialBalance: Double = 0.0
+// ============================================================
+// Flow: ленивый поток
+// ============================================================
+fun sensorFlow(sensorId: String): Flow<SensorReading> = flow {
+    println("Поток $sensorId запущен")
+    for (i in 0..9) {
+        delay(300L)
+        emit(SensorReading(sensorId, 15.0 + i * 2.0, System.currentTimeMillis()))
+    }
 }
 
-fun createWallet(block: WalletBuilder.() -> Unit): SmartWallet {
-    val builder = WalletBuilder()
-    builder.block()
-    return SmartWallet(builder.owner, builder.initialBalance)
-}
+// ============================================================
+// main: сравнение двух подходов
+// ============================================================
+suspend fun main() = coroutineScope<Unit> {
 
-fun main() {
-    println("--- Шаг 1: создание кошелька (createWallet, apply, also) ---")
-    val wallet = createWallet {
-        owner = "Иван Петров"
-        initialBalance = 1000.0
-    }.apply {
-        printOwnerInfo()
-    }.also {
-        println("Кошелек создан, баланс: ${it.balance.formatAsCurrency()}")
+    println("=== Часть 1: каналы и корутины (3 датчика, 30 показаний) ===")
+    val channel = Channel<SensorReading>()
+    launch { emitSensorData(channel) }
+    var count = 0
+    for (msg in channel) {
+        count++
+        println("Получено из канала №$count: $msg")
     }
+    println("Всего получено показаний: $count")
 
-    println("--- Шаг 2: оператор plus (+500.0) ---")
-    wallet + 500.0
+    println("=== Часть 2: Flow (ленивость, цепочка операций) ===")
+    val tempFlow = sensorFlow("TEMP")
+        .filter { it.value > 20.0 }
+        .map { it.copy(value = it.value * 1.1) }
+        .take(5)
+        .onEach { println("Обработано: $it") }
+    println("Цепочка операций собрана, но поток ещё молчит")
+    println("Вызываем терминальную операцию toList()")
+    val readings = tempFlow.toList()
+    println("Результат toList(): $readings")
 
-    println("--- Шаг 3: let и имя владельца ---")
-    wallet.owner?.let {
-        println("Имя владельца проверено: $it")
+    println("=== Часть 3: fold - сумма и среднее ===")
+    val total = tempFlow.fold(Pair(0.0, 0)) { acc, reading ->
+        Pair(acc.first + reading.value, acc.second + 1)
     }
-
-    println("--- Шаг 4: оператор minus (-2000.0) ---")
-    try {
-        wallet - 2000.0
-    } catch (e: InsufficientFundsException) {
-        println("Ошибка: ${e.message}")
-    }
-
-    println("--- Шаг 5: CryptoPayment, is и as? ---")
-    val payment: PaymentMethod = CryptoPayment("0xA1B2C3D4E5F6")
-    if (payment is CryptoPayment) {
-        val crypto = payment as? CryptoPayment
-        println("Адрес криптокошелька: ${crypto?.walletAddress}")
-    }
-
-    println("--- Шаг 6: lazy (auditInfo) ---")
-    println(wallet.auditInfo)
-
-    println("--- Шаг 7: инфиксная нотация ---")
-    println(750.5 formattedAs "NC")
+    val average = total.first / total.second
+    println("Сумма: ${total.first}, количество: ${total.second}, среднее: $average")
 }
